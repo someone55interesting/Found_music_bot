@@ -1,114 +1,124 @@
-import asyncio
 import os
+import asyncio
 from aiogram import Bot, Dispatcher, F
-from aiogram.types import Message, ContentType
+from aiogram.types import Message
 from shazamio import Shazam
+from typing import Optional, Tuple
 
-# --- НАСТРОЙКИ ---
-# Получи токен у @BotFather в Telegram и вставь сюда внутрь кавычек
-TOKEN = os.getenv("BOT_TOKEN")
+# Берем токен из переменных окружения (безопасно)
+TOKEN = os.getenv("BOT_TOKEN") 
+# Если запускаешь локально и лень настраивать env, раскомментируй строку ниже и вставь токен:
 
-# Инициализация
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
 shazam = Shazam()
 
-# --- ХЭНДЛЕР: ПРИВЕТСТВИЕ ---
-@dp.message(F.text == "/start")
-async def cmd_start(message: Message):
-    await message.answer(
-        "Привет, бро! 🎧\n"
-        "Я бесплатный музыкальный бот.\n\n"
-        "1. Отправь мне **название песни**, и я найду её.\n"
-        "2. Отправь мне **голосовое** или **аудиофайл** с музыкой, и я скажу, что это играет."
-    )
+# =============================
+# Форматирование результата
+# =============================
+def format_track_info(track_data: dict) -> Tuple[str, Optional[str], Optional[str]]:
+    title = track_data.get("title", "Неизвестно")
+    subtitle = track_data.get("subtitle", "")
+    image = track_data.get("images", {}).get("coverart")
+    url = track_data.get("url", "")
 
-# --- ХЭНДЛЕР: ПОИСК ПО ТЕКСТУ ---
-@dp.message(F.text)
-async def search_by_text(message: Message):
-    query = message.text
-    await message.answer(f"🔎 Ищу: {query}...")
+    text = f"🎵 <b>{title}</b>\n👤 {subtitle}\n\n"
+    if url:
+        text += f"🔗 <a href=\"{url}\">Слушать</a>"
+
+    return text, image, url
+
+# =============================
+# Анализ файла (универсальная функция)
+# =============================
+async def process_and_recognize(message: Message, file_id: str, file_ext: str):
+    # Создаем уникальное имя файла
+    file_path = f"temp_{file_id}{file_ext}"
     
     try:
-        # Ищем треки
-        search_results = await shazam.search_track(query=query, limit=1)
+        # 1. Скачиваем файл
+        file = await bot.get_file(file_id)
+        await bot.download_file(file.file_path, file_path)
         
-        # Разбираем результат (немного json магии)
-        if search_results and 'tracks' in search_results and 'hits' in search_results['tracks']:
-            track = search_results['tracks']['hits'][0]
-            title = track['heading']['title']
-            artist = track['heading']['subtitle']
-            
-            # Можно вытащить картинку и ссылку, но пока дадим просто текст
-            response = f"🎵 **Нашел!**\n\n🎤 Артист: {artist}\n🎼 Трек: {title}"
-            
-            # Если есть ссылка на фото обложки
-            image_url = track['images'].get('default')
-            if image_url:
-                await message.answer_photo(image_url, caption=response)
-            else:
-                await message.answer(response)
-        else:
-            await message.answer("Ничего не нашел, брат. Попробуй по-другому.")
-            
-    except Exception as e:
-        await message.answer(f"Ошибка при поиске: {e}")
-
-# --- ХЭНДЛЕР: РАСПОЗНАВАНИЕ ФАЙЛА (ГОЛОС ИЛИ АУДИО) ---
-@dp.message(F.content_type.in_({'voice', 'audio', 'document'}))
-async def recognize_file(message: Message):
-    await message.answer("👂 Слушаю... дай секунду.")
-    
-    # Определяем файл
-    if message.voice:
-        file_id = message.voice.file_id
-    elif message.audio:
-        file_id = message.audio.file_id
-    elif message.document:
-         # Проверка, что документ — это аудио (по mime_type)
-        if 'audio' in message.document.mime_type:
-            file_id = message.document.file_id
-        else:
-            await message.answer("Брат, это не музыкальный файл.")
-            return
-    else:
-        return
-
-    # Скачиваем файл во временную папку
-    file = await bot.get_file(file_id)
-    file_path = f"temp_{file_id}.ogg"
-    await bot.download_file(file.file_path, file_path)
-
-    try:
-        # Распознаем через ShazamIO
+        # 2. Распознаем через Shazam
+        # ВАЖНО: Для работы с .mp4 нужен установленный FFmpeg в системе!
         out = await shazam.recognize_song(file_path)
         
+        # 3. Проверяем результат
         if out and 'track' in out:
-            track_info = out['track']
-            title = track_info['title']
-            artist = track_info['subtitle']
-            image_url = track_info['images'].get('coverart')
-            
-            caption = f"🎧 **Распознал!**\n\n🎤 Артист: {artist}\n🎼 Трек: {title}"
-            
-            if image_url:
-                await message.answer_photo(image_url, caption=caption)
+            track = out['track']
+            text, image, _ = format_track_info(track)
+            if image:
+                await message.answer_photo(photo=image, caption=text, parse_mode="HTML")
             else:
-                await message.answer(caption)
+                await message.answer(text, parse_mode="HTML")
         else:
-            await message.answer("Не смог распознать, слишком много шума или трек редкий.")
+            await message.answer("🤷‍♂️ Не смог распознать этот трек.")
             
     except Exception as e:
-        await message.answer("Произошла ошибка при распознавании.")
-        print(e)
+        print(f"ОШИБКА ПРИ РАСПОЗНАВАНИИ: {e}") # Смотри сюда в терминале!
+        await message.answer("⚠ Произошла ошибка при обработке файла.")
+        
     finally:
-        # Удаляем временный файл, чтобы не засорять память
+        # 4. Удаляем файл, даже если была ошибка
         if os.path.exists(file_path):
             os.remove(file_path)
 
-# --- ЗАПУСК ---
+# =============================
+# Хэндлеры
+# =============================
+
+@dp.message(F.text == "/start")
+async def start_cmd(msg: Message):
+    await msg.answer("👋 Привет! Кидай мне музыку, видео или голосовое, я найду трек.")
+
+@dp.message(F.text)
+async def search_by_text(msg: Message):
+    try:
+        res = await shazam.search_track(msg.text)
+        if res and "tracks" in res and "hits" in res["tracks"] and res["tracks"]["hits"]:
+            track = res["tracks"]["hits"][0]["track"]
+            text, image, _ = format_track_info(track)
+            await msg.answer_photo(photo=image, caption=text, parse_mode="HTML")
+        else:
+            await msg.answer("❌ Ничего не найдено.")
+    except Exception as e:
+        print(f"Ошибка поиска текста: {e}")
+        await msg.answer("⚠ Ошибка при поиске.")
+
+@dp.message(F.voice)
+async def voice_handler(msg: Message):
+    await msg.answer("🎧 Слушаю голосовое...")
+    await process_and_recognize(msg, msg.voice.file_id, ".ogg")
+
+@dp.message(F.audio)
+async def audio_handler(msg: Message):
+    await msg.answer("🎧 Слушаю аудио...")
+    await process_and_recognize(msg, msg.audio.file_id, ".mp3")
+
+@dp.message(F.video)
+async def video_handler(msg: Message):
+    await msg.answer("👀 Смотрю видео и слушаю...")
+    # Сохраняем как mp4. Shazamio сам вытащит звук, если есть FFmpeg
+    await process_and_recognize(msg, msg.video.file_id, ".mp4")
+
+@dp.message(F.document)
+async def doc_handler(msg: Message):
+    # Обработка файлов, отправленных как документ
+    if msg.document.mime_type and 'audio' in msg.document.mime_type:
+        await msg.answer("🎧 Анализирую файл...")
+        await process_and_recognize(msg, msg.document.file_id, ".mp3")
+    elif msg.document.mime_type and 'video' in msg.document.mime_type:
+        await msg.answer("👀 Анализирую видео-файл...")
+        await process_and_recognize(msg, msg.document.file_id, ".mp4")
+    else:
+        await msg.answer("Это не похоже на музыку или видео.")
+
+# =============================
+# Запуск
+# =============================
 async def main():
-    print("Бот запущен...")
+    print("Bot started! 🚀")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
